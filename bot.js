@@ -1,4 +1,3 @@
-require("dotenv").config();
 const { Client, GatewayIntentBits, Events } = require("discord.js");
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -30,18 +29,35 @@ const mirroredMessages = new Map();
 
 /** Collect every attachment URL + embed image/video URL from a message. */
 function extractMedia(message) {
+  const seen = new Set();
   const urls = [];
 
-  // Direct file attachments
-  for (const attachment of message.attachments.values()) {
-    urls.push(attachment.url);
+  function add(url) {
+    if (url && !seen.has(url)) {
+      seen.add(url);
+      urls.push(url);
+    }
   }
 
-  // Embedded images / videos (link-unfurls, rich embeds, etc.)
+  // 1. Direct file attachments (e.g. uploaded images/videos)
+  for (const attachment of message.attachments.values()) {
+    add(attachment.url);
+  }
+
+  // 2. All embed fields — Make it a Quote posts the generated image here
   for (const embed of message.embeds) {
-    if (embed.image?.url)     urls.push(embed.image.url);
-    if (embed.video?.url)     urls.push(embed.video.url);
-    if (embed.thumbnail?.url) urls.push(embed.thumbnail.url);
+    add(embed.url);               // top-level embed URL
+    add(embed.image?.url);        // embed image
+    add(embed.image?.proxyURL);   // embed image proxy (fallback)
+    add(embed.video?.url);        // embed video
+    add(embed.thumbnail?.url);    // embed thumbnail
+  }
+
+  // 3. Raw image/video URLs posted directly in message content
+  const urlPattern = /https?:\/\/\S+\.(?:png|jpe?g|gif|webp|mp4|mov|webm)(?:\?\S*)?/gi;
+  const contentMatches = message.content.match(urlPattern) || [];
+  for (const url of contentMatches) {
+    add(url);
   }
 
   return urls;
