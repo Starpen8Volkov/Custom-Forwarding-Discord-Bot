@@ -9,6 +9,8 @@ const {
 } = require("discord.js");
 const https = require("https");
 const http  = require("http");
+const fs    = require("fs");
+const path  = require("path");
 
 // ── Configuration ────────────────────────────────────────────────────────────
 // Each of these accepts comma-separated values, e.g. "123,456,789"
@@ -20,6 +22,12 @@ const IGNORED_CHANNEL_IDS = (process.env.IGNORED_CHANNEL_ID || "").split(",").ma
 const HIGHLIGHT_CHANNEL_ID = (process.env.HIGHLIGHT_ID         || "").trim();
 const HUMAN_ROLE_ID        = (process.env.HUMAN_ROLE_ID        || "").trim();
 const HIGHLIGHT_PERCENTAGE = parseFloat(process.env.HIGHLIGHT_PERCENTAGE || "0") / 100; // stored as 0-1
+
+// Persistence
+// TIMEOUT: entries older than this many hours are pruned on startup and every 12 h.
+// Default 168 h (7 days). Set to 0 to disable pruning.
+const TIMEOUT_HOURS  = parseFloat(process.env.TIMEOUT || "168");
+const STATE_FILE     = path.resolve(process.env.STATE_FILE || "./mirror-state.json");
 
 // Format: "USER_ID=Some message,USER_ID2=Another message"
 // Whenever a quote is authored by one of these users, the message is appended in italics.
@@ -76,6 +84,7 @@ const client = new Client({
  *   mirroredId      : string,          ← id of the bot-sent copy in the target channel
  *   targetChannelId : string,
  *   highlightId     : string | null,   ← id of the highlight-channel copy (if sent)
+ *   mirroredAt      : number,          ← Unix ms timestamp when the mirror was first sent
  * }
  */
 const mirroredMessages = new Map();
@@ -101,6 +110,10 @@ const sourceChannelMap = new Map();
  * Populated by syncExternalReactions() — reads Discord reactions on the source-bot
  * message and the original quoted message and merges them (same user + same emoji
  * on both messages counts only once).
+ *
+ * NOTE: reactionState is intentionally NOT persisted to disk. It is rebuilt live
+ * from Discord on the next reaction event after a restart. Persisting user-id sets
+ * would bloat the file and go stale anyway since reactions can change while offline.
  */
 const reactionState = new Map();
 
@@ -109,10 +122,144 @@ const reactionState = new Map();
  *
  * Reverse lookup used by reaction event handlers to find which source
  * message (and therefore which reactionState entry) owns a given mirrored message.
+ * Rebuilt from mirroredMessages on startup.
  */
 const mirrorToSource = new Map();
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Persistence ───────────────────────────────────────────────────────────────
+//
+// The state file is a plain JSON object:
+// {
+//   "savedAt": <Unix ms>,
+//   "entries": {
+//     "<sourceMessageId>": {
+//       "sourceChannelId": "...",
+//       "mirrors": [
+//         {
+//           "mirroredId": "...",
+//           "targetChannelId": "...",
+//           "highlightId": "..." | null,
+//           "mirroredAt": <Unix ms>
+//         }
+//       ]
+//     }
+//   }
+// }
+
+/** Serialise current in-memory state and write it to STATE_FILE. */
+function saveState() {
+  try {
+    const entries = {};
+    for (const [srcId, mirrors] of mirroredMessages) {
+      entries[srcId] = {
+        sourceChannelId: sourceChannelMap.get(srcId) || null,
+        mirrors: mirrors.map(e => ({
+          mirroredId:      e.mirroredId,
+          targetChannelId: e.targetChannelId,
+          highlightId:     e.highlightId ?? null,
+          mirroredAt:      e.mirroredAt  ?? Date.now(),
+        })),
+      };
+    }
+    const payload = JSON.stringify({ savedAt: Date.now(), entries }, null, 2);
+    fs.writeFileSync(STATE_FILE, payload, "utf8");
+  } catch (err) {
+    console.error("❌  Failed to save state:", err.message);
+  }
+}
+
+/**
+ * Load state from STATE_FILE into the in-memory maps.
+ * Entries older than TIMEOUT_HOURS are skipped immediately.
+ * Also rebuilds mirrorToSource from the loaded data.
+ */
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) {
+    console.log(`ℹ️   No state file found at ${STATE_FILE} — starting fresh.`);
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch (err) {
+    console.error("❌  Could not parse state file — starting fresh:", err.message);
+    return;
+  }
+
+  const { entries = {} } = parsed;
+  const cutoff = TIMEOUT_HOURS > 0 ? Date.now() - TIMEOUT_HOURS * 60 * 60 * 1000 : 0;
+  let loaded = 0, pruned = 0;
+
+  for (const [srcId, data] of Object.entries(entries)) {
+    const mirrors = (data.mirrors || []).filter(e => {
+      if (cutoff > 0 && e.mirroredAt && e.mirroredAt < cutoff) {
+        pruned++;
+        return false;
+      }
+      return true;
+    });
+
+    if (mirrors.length === 0) {
+      pruned++;
+      continue;
+    }
+
+    mirroredMessages.set(srcId, mirrors);
+    sourceChannelMap.set(srcId, data.sourceChannelId);
+
+    for (const e of mirrors) {
+      mirrorToSource.set(e.mirroredId, srcId);
+      if (e.highlightId) mirrorToSource.set(e.highlightId, srcId);
+    }
+
+    loaded++;
+  }
+
+  console.log(`💾  State loaded: ${loaded} active entries restored, ${pruned} pruned (older than ${TIMEOUT_HOURS}h).`);
+}
+
+/**
+ * Remove entries from all maps whose mirroredAt is older than TIMEOUT_HOURS,
+ * then persist the trimmed state.
+ */
+function pruneOldEntries() {
+  if (TIMEOUT_HOURS <= 0) return;
+  const cutoff = Date.now() - TIMEOUT_HOURS * 60 * 60 * 1000;
+  let pruned = 0;
+
+  for (const [srcId, mirrors] of mirroredMessages) {
+    const fresh = mirrors.filter(e => !e.mirroredAt || e.mirroredAt >= cutoff);
+    if (fresh.length < mirrors.length) {
+      pruned += mirrors.length - fresh.length;
+      if (fresh.length === 0) {
+        mirroredMessages.delete(srcId);
+        sourceChannelMap.delete(srcId);
+        reactionState.delete(srcId);
+      } else {
+        mirroredMessages.set(srcId, fresh);
+      }
+    }
+  }
+
+  // Rebuild mirrorToSource cleanly after pruning
+  mirrorToSource.clear();
+  for (const [srcId, mirrors] of mirroredMessages) {
+    for (const e of mirrors) {
+      mirrorToSource.set(e.mirroredId, srcId);
+      if (e.highlightId) mirrorToSource.set(e.highlightId, srcId);
+    }
+  }
+
+  if (pruned > 0) {
+    console.log(`🧹  Pruned ${pruned} mirror entries older than ${TIMEOUT_HOURS}h.`);
+    saveState();
+  } else {
+    console.log(`🧹  Prune check: no expired entries found.`);
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Download a URL and return a Buffer. */
 function fetchBuffer(url) {
@@ -136,7 +283,6 @@ function guessFilename(url) {
   try {
     const pathname = new URL(url).pathname;
     const base = pathname.split("/").pop() || "image";
-    // Strip query params that leaked into the basename
     return base.split("?")[0] || "image.png";
   } catch {
     return "image.png";
@@ -479,7 +625,6 @@ async function countHumanMembers(guild) {
     if (role.members.size > 0) return role.members.size;
 
     // Fallback: paginate guild.members.list filtered by role
-    // This REST call is allowed without the privileged intent.
     let total = 0;
     let after = "0";
     while (true) {
@@ -517,7 +662,13 @@ function countUniqueReactors(state) {
  * Returns the highlight message id if sent, null otherwise.
  */
 async function maybeSendHighlight(sourceMessage, content, attachments, state) {
-  if (!HIGHLIGHT_CHANNEL_ID || !HUMAN_ROLE_ID) return null;
+  if (!HIGHLIGHT_CHANNEL_ID || !HUMAN_ROLE_ID) {
+    console.log(
+      `⚠️  Highlight skipped: HIGHLIGHT_CHANNEL_ID=${HIGHLIGHT_CHANNEL_ID || "(unset)"}, ` +
+      `HUMAN_ROLE_ID=${HUMAN_ROLE_ID || "(unset)"}`
+    );
+    return null;
+  }
 
   const guild = sourceMessage.guild;
   if (!guild) return null;
@@ -570,6 +721,7 @@ async function mirrorToAllTargets(sourceMessage, mediaUrls) {
   const rows  = buildButtonRows(state); // neutral view on first render
 
   const results = [];
+  const now = Date.now();
 
   for (const channelId of TARGET_CHANNEL_IDS) {
     try {
@@ -593,6 +745,7 @@ async function mirrorToAllTargets(sourceMessage, mediaUrls) {
         mirroredId:      mirrored.id,
         targetChannelId: channelId,
         highlightId:     highlightId ?? null,
+        mirroredAt:      now,
       });
     } catch (err) {
       console.error(`❌  Failed to mirror to channel ${channelId}:`, err);
@@ -619,6 +772,16 @@ client.once(Events.ClientReady, () => {
   if (Object.keys(SPECIAL_USER_MESSAGES).length > 0) {
     console.log(`   Special users         : ${Object.keys(SPECIAL_USER_MESSAGES).join(", ")}`);
   }
+  console.log(`   State file            : ${STATE_FILE}`);
+  console.log(`   Timeout (prune after) : ${TIMEOUT_HOURS > 0 ? TIMEOUT_HOURS + "h" : "disabled"}`);
+  console.log(`   Active mirror entries : ${mirroredMessages.size}`);
+
+  // Startup prune — removes entries older than TIMEOUT_HOURS that survived the
+  // initial load (e.g. entries added just under the cutoff on load, now expired).
+  pruneOldEntries();
+
+  // 12-hourly prune schedule
+  setInterval(pruneOldEntries, 12 * 60 * 60 * 1000);
 });
 
 // New message ─────────────────────────────────────────────────────────────────
@@ -654,15 +817,19 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   const mirrors = await mirrorToAllTargets(message, mediaUrls);
-  if (mirrors.length > 0) mirroredMessages.set(message.id, mirrors);
+  if (mirrors.length > 0) {
+    mirroredMessages.set(message.id, mirrors);
+    saveState();
+  }
 });
 
 // Edited message ──────────────────────────────────────────────────────────────
 client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
-  if (newMessage.partial) {
-    try { newMessage = await newMessage.fetch(); }
-    catch (err) { console.error("❌  Could not fetch updated message:", err); return; }
-  }
+  // Always fetch the full message first — partial messages have a null author,
+  // which causes isRelevant() to silently return false (e.g. when source media
+  // is deleted and Discord fires a partial MessageUpdate).
+  try { newMessage = await newMessage.fetch(); }
+  catch (err) { console.error("❌  Could not fetch updated message:", err); return; }
 
   if (!isRelevant(newMessage)) return;
 
@@ -673,7 +840,10 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
   if (mirrors.length === 0) {
     if (mediaUrls.length === 0) return;
     const newMirrors = await mirrorToAllTargets(newMessage, mediaUrls);
-    if (newMirrors.length > 0) mirroredMessages.set(newMessage.id, newMirrors);
+    if (newMirrors.length > 0) {
+      mirroredMessages.set(newMessage.id, newMirrors);
+      saveState();
+    }
     return;
   }
 
@@ -726,6 +896,7 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
         mirrorToSource.delete(entry.mirroredId);
         mirrorToSource.set(newMirrored.id, newMessage.id);
         entry.mirroredId = newMirrored.id;
+        // Preserve original mirroredAt so the entry doesn't reset its age
 
         // Update highlight copy if it exists
         if (entry.highlightId) {
@@ -761,6 +932,8 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
     reactionState.delete(newMessage.id);
     sourceChannelMap.delete(newMessage.id);
   }
+
+  saveState();
 });
 
 // Deleted message ─────────────────────────────────────────────────────────────
@@ -796,6 +969,7 @@ client.on(Events.MessageDelete, async (message) => {
   mirroredMessages.delete(message.id);
   reactionState.delete(message.id);
   sourceChannelMap.delete(message.id);
+  saveState();
 });
 
 // ── Reaction events ───────────────────────────────────────────────────────────
@@ -841,7 +1015,12 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     catch (err) { console.error("❌  Could not fetch reaction:", err); return; }
   }
 
-  const reactedMsg = reaction.message;
+  let reactedMsg = reaction.message;
+  // Always fetch a full message so author is never null
+  if (reactedMsg.partial) {
+    try { reactedMsg = await reactedMsg.fetch(); }
+    catch (err) { console.error("❌  Could not fetch reacted message:", err); return; }
+  }
 
   // ── Path A: reaction on the source-bot message ──
   if (SOURCE_BOT_IDS.includes(reactedMsg.author?.id) && mirroredMessages.has(reactedMsg.id)) {
@@ -861,8 +1040,41 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
         if (hlId) {
           mirrorToSource.set(hlId, fullSource.id);
           entry.highlightId = hlId;
+          saveState();
         }
       }
+    }
+    return;
+  }
+
+  // ── Path C: reaction on the bot's own mirrored/highlight message ──
+  // This is the main path after a restart — the bot sent the mirror, so
+  // mirrorToSource maps the mirrored message id back to the source.
+  const sourceIdC = mirrorToSource.get(reactedMsg.id);
+  if (sourceIdC) {
+    const srcChannelId = sourceChannelMap.get(sourceIdC);
+    if (!srcChannelId) return;
+    try {
+      const srcChannel = await client.channels.fetch(srcChannelId);
+      const srcMsg     = await srcChannel.messages.fetch(sourceIdC);
+      const state      = await syncAndPush(srcMsg);
+      const mirrors    = mirroredMessages.get(sourceIdC) || [];
+
+      for (const entry of mirrors) {
+        if (!entry.highlightId && HIGHLIGHT_CHANNEL_ID) {
+          const contentStr = await buildContent(srcMsg);
+          const mediaUrls  = extractMedia(srcMsg);
+          const attFiles   = await buildAttachments(mediaUrls);
+          const hlId = await maybeSendHighlight(srcMsg, contentStr, attFiles, state);
+          if (hlId) {
+            mirrorToSource.set(hlId, sourceIdC);
+            entry.highlightId = hlId;
+            saveState();
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`⚠️  Could not sync reaction add for mirrored message ${reactedMsg.id}:`, err.message);
     }
     return;
   }
@@ -889,6 +1101,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
         if (hlId) {
           mirrorToSource.set(hlId, sourceId);
           entry.highlightId = hlId;
+          saveState();
         }
       }
     }
@@ -906,7 +1119,12 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
     catch (err) { console.error("❌  Could not fetch reaction:", err); return; }
   }
 
-  const reactedMsg = reaction.message;
+  let reactedMsg = reaction.message;
+  // Always fetch a full message so author is never null
+  if (reactedMsg.partial) {
+    try { reactedMsg = await reactedMsg.fetch(); }
+    catch (err) { console.error("❌  Could not fetch reacted message:", err); return; }
+  }
 
   // ── Path A: reaction removed from the source-bot message ──
   if (SOURCE_BOT_IDS.includes(reactedMsg.author?.id) && mirroredMessages.has(reactedMsg.id)) {
@@ -914,6 +1132,21 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
     try { fullSource = await reactedMsg.fetch(); } catch { return; }
     // Re-syncing will call reaction.users.fetch() which now excludes the removed user
     await syncAndPush(fullSource);
+    return;
+  }
+
+  // ── Path C: reaction removed from the bot's own mirrored/highlight message ──
+  const sourceIdC = mirrorToSource.get(reactedMsg.id);
+  if (sourceIdC) {
+    const srcChannelId = sourceChannelMap.get(sourceIdC);
+    if (!srcChannelId) return;
+    try {
+      const srcChannel = await client.channels.fetch(srcChannelId);
+      const srcMsg     = await srcChannel.messages.fetch(sourceIdC);
+      await syncAndPush(srcMsg);
+    } catch (err) {
+      console.warn(`⚠️  Could not sync reaction remove for mirrored message ${reactedMsg.id}:`, err.message);
+    }
     return;
   }
 
@@ -935,13 +1168,32 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
 
 // All reactions cleared ───────────────────────────────────────────────────────
 client.on(Events.MessageReactionRemoveAll, async (message) => {
+  // Always fetch the full message first so author/id are reliable
+  if (message.partial) {
+    try { message = await message.fetch(); }
+    catch (err) { console.error("❌  Could not fetch message for reaction-clear:", err); return; }
+  }
+
   // ── Path A: cleared on the source-bot message ──
   if (mirroredMessages.has(message.id)) {
-    // Re-syncing will find zero reactions and update buttons accordingly.
-    // Button-press entries in reactionState are intentionally preserved.
     let fullSource;
     try { fullSource = await message.fetch(); } catch { return; }
     await syncAndPush(fullSource);
+    return;
+  }
+
+  // ── Path C: cleared on the bot's own mirrored/highlight message ──
+  const sourceIdC = mirrorToSource.get(message.id);
+  if (sourceIdC) {
+    const srcChannelId = sourceChannelMap.get(sourceIdC);
+    if (!srcChannelId) return;
+    try {
+      const srcChannel = await client.channels.fetch(srcChannelId);
+      const srcMsg     = await srcChannel.messages.fetch(sourceIdC);
+      await syncAndPush(srcMsg);
+    } catch (err) {
+      console.warn(`⚠️  Could not sync reaction-clear for mirrored message ${message.id}:`, err.message);
+    }
     return;
   }
 
@@ -961,5 +1213,8 @@ client.on(Events.MessageReactionRemoveAll, async (message) => {
   }
 });
 
-// ── Connect ──────────────────────────────────────────────────────────────────
+// ── Boot sequence ─────────────────────────────────────────────────────────────
+// Load persisted state before connecting so the maps are populated
+// before any Discord events can fire.
+loadState();
 client.login(BOT_TOKEN);
