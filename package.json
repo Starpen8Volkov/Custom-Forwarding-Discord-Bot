@@ -4,9 +4,10 @@
   "description": "Mirrors media from a specific Discord bot to a target channel.",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    	"start": "node bot.js"
   },
   "dependencies": {
-    "discord.js": "^14.16.3"
+    	"discord.js": "^14.16.3",
+	"dotenv": "^16.0.0"
   }
 }
