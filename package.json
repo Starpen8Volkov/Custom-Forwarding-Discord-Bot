@@ -1,0 +1,12 @@
+{
+  "name": "media-mirror-bot",
+  "version": "1.0.0",
+  "description": "Mirrors media from a specific Discord bot to a target channel.",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  }
+}
