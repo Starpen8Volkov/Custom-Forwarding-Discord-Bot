@@ -63,7 +63,7 @@ const client = new Client({
     // GuildMembers is a privileged intent — enable it in the Discord Developer
     // Portal (Bot → Privileged Gateway Intents → Server Members Intent) and
     // uncomment the line below for accurate human-role member counts.
-    // GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -98,22 +98,17 @@ const sourceChannelMap = new Map();
  * emojiKey for unicode emoji : the character itself, e.g. "👍"
  * emojiKey for custom emoji  : "<name>:<id>",          e.g. "pepehands:123456789"
  *
- * Populated from two sources:
- *   • syncExternalReactions() — reads Discord reactions on the source-bot message
- *     and the original quoted message and merges them (same user + same emoji
- *     on both messages counts only once).
- *   • InteractionCreate — toggles a user in/out when they click a button.
- *
- * Button-press entries survive re-syncs; syncExternalReactions only adds users,
- * it does not remove users who pressed a button.
+ * Populated by syncExternalReactions() — reads Discord reactions on the source-bot
+ * message and the original quoted message and merges them (same user + same emoji
+ * on both messages counts only once).
  */
 const reactionState = new Map();
 
 /**
  * mirrorToSource:  mirroredMsgId | highlightMsgId → sourceMessageId
  *
- * Reverse lookup used by the button-interaction handler to find which source
- * message (and therefore which reactionState entry) owns a given button message.
+ * Reverse lookup used by reaction event handlers to find which source
+ * message (and therefore which reactionState entry) owns a given mirrored message.
  */
 const mirrorToSource = new Map();
 
@@ -257,7 +252,7 @@ async function buildContent(sourceMessage) {
   // Special user message — placed below media text, above reactions
   if (author?.id && SPECIAL_USER_MESSAGES[author.id]) {
     const specialMsg = SPECIAL_USER_MESSAGES[author.id];
-    lines.push(`✨ * ${specialMsg} * ✨`);
+    lines.push(`✨   *${specialMsg}*   ✨`);
   }
 
   return lines.join("\n");
@@ -322,8 +317,7 @@ function decodeButtonId(customId) {
  * Each button:
  *   • Emoji label  — the actual emoji character / custom emoji
  *   • Count label  — number of unique users in the set
- *   • Style        — Primary (blurple) if viewerUserId is in the set (i.e. "you reacted"),
- *                    Secondary (grey) otherwise — matching Discord's own toggle appearance.
+ *   • Style        — always Secondary (grey); no per-user toggle highlighting.
  *
  * Discord buttons do NOT support hover tooltips (no title/description field on
  * message components), so we cannot list reacted users on hover.
@@ -331,20 +325,19 @@ function decodeButtonId(customId) {
  * Discord limits: 5 buttons per ActionRow, 5 rows per message (25 buttons max).
  * Emojis with zero count are skipped.
  */
-function buildButtonRows(mergedMap, viewerUserId = null) {
+function buildButtonRows(mergedMap) {
   const buttons = [];
 
   for (const [key, userSet] of mergedMap) {
     const count = userSet.size;
     if (count === 0) continue;
 
-    const isActive = viewerUserId !== null && userSet.has(viewerUserId);
-
     const btn = new ButtonBuilder()
       .setCustomId(encodeButtonId(key))
       .setEmoji(emojiArgFromKey(key))
       .setLabel(String(count))
-      .setStyle(isActive ? ButtonStyle.Primary : ButtonStyle.Secondary);
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true);
 
     buttons.push(btn);
     if (buttons.length >= 25) break; // hard Discord cap
@@ -373,15 +366,16 @@ function getOrCreateState(sourceId) {
  *   1. The source-bot message itself.
  *   2. The original quoted message it references (if any).
  *
- * Merge them into reactionState[sourceId], deduplicating same user + same emoji
- * across the two messages.  Button-press entries written by InteractionCreate
- * are preserved — this function only adds, never removes.
+ * Merge them into reactionState[sourceId], clearing first so that removed
+ * reactions are properly reflected (no stale users left in the set).
  *
  * Returns the updated Map<emojiKey, Set<userId>>.
  */
 async function syncExternalReactions(sourceMessage) {
   const sourceId = sourceMessage.id;
-  const state    = getOrCreateState(sourceId);
+  // Clear and rebuild from scratch so removed reactions are reflected.
+  reactionState.set(sourceId, new Map());
+  const state = reactionState.get(sourceId);
 
   async function absorb(msg) {
     let fullMsg = msg;
@@ -426,10 +420,9 @@ async function syncExternalReactions(sourceMessage) {
  * Push the current merged state as button rows to every bot-sent copy that
  * belongs to sourceId: the mirrored message(s) and the highlight copy (if any).
  *
- * viewerMap is an optional Map<msgId, userId> used to show the per-user toggle
- * state (Primary) on a specific message for a specific viewer.
+ * Buttons are always rendered in Secondary (grey) style — no per-user toggle.
  */
-async function pushButtons(sourceId, viewerMap = new Map()) {
+async function pushButtons(sourceId) {
   const state   = reactionState.get(sourceId);
   if (!state) return;
 
@@ -439,10 +432,9 @@ async function pushButtons(sourceId, viewerMap = new Map()) {
   for (const entry of mirrors) {
     // Mirrored message
     try {
-      const viewer = viewerMap.get(entry.mirroredId) ?? null;
-      const rows   = buildButtonRows(state, viewer);
-      const ch     = await client.channels.fetch(entry.targetChannelId);
-      const msg    = await ch.messages.fetch(entry.mirroredId);
+      const rows = buildButtonRows(state);
+      const ch   = await client.channels.fetch(entry.targetChannelId);
+      const msg  = await ch.messages.fetch(entry.mirroredId);
       await msg.edit({ components: rows });
     } catch (err) {
       console.warn(`⚠️  Could not push buttons to mirror ${entry.mirroredId}:`, err.message);
@@ -451,10 +443,9 @@ async function pushButtons(sourceId, viewerMap = new Map()) {
     // Highlight copy
     if (entry.highlightId) {
       try {
-        const viewer = viewerMap.get(entry.highlightId) ?? null;
-        const rows   = buildButtonRows(state, viewer);
-        const hlCh   = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
-        const hlMsg  = await hlCh.messages.fetch(entry.highlightId);
+        const rows  = buildButtonRows(state);
+        const hlCh  = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
+        const hlMsg = await hlCh.messages.fetch(entry.highlightId);
         await hlMsg.edit({ components: rows });
       } catch (err) {
         console.warn(`⚠️  Could not push buttons to highlight ${entry.highlightId}:`, err.message);
@@ -526,23 +517,29 @@ function countUniqueReactors(state) {
  * Returns the highlight message id if sent, null otherwise.
  */
 async function maybeSendHighlight(sourceMessage, content, attachments, state) {
-  if (!HIGHLIGHT_CHANNEL_ID || !HUMAN_ROLE_ID || HIGHLIGHT_PERCENTAGE <= 0) return null;
+  if (!HIGHLIGHT_CHANNEL_ID || !HUMAN_ROLE_ID) return null;
 
   const guild = sourceMessage.guild;
   if (!guild) return null;
 
-  const humanCount   = await countHumanMembers(guild);
   const reactorCount = countUniqueReactors(state);
 
-  if (humanCount === 0) return null;
+  // 0% threshold means every reacted message is highlighted
+  if (HIGHLIGHT_PERCENTAGE <= 0) {
+    if (reactorCount === 0) return null;
+  } else {
+    const humanCount = await countHumanMembers(guild);
 
-  const ratio = reactorCount / humanCount;
-  console.log(
-    `📊  Highlight check: ${reactorCount} reactors / ${humanCount} humans = ${(ratio * 100).toFixed(1)}% ` +
-    `(threshold ${(HIGHLIGHT_PERCENTAGE * 100).toFixed(1)}%)`
-  );
+    // If we can't determine the role size, fall back to requiring at least 1 reactor
+    const ratio = humanCount > 0 ? reactorCount / humanCount : (reactorCount > 0 ? 1 : 0);
+    console.log(
+      `📊  Highlight check: ${reactorCount} reactors` +
+      (humanCount > 0 ? ` / ${humanCount} humans = ${(ratio * 100).toFixed(1)}%` : ` (role size unknown)`) +
+      ` (threshold ${(HIGHLIGHT_PERCENTAGE * 100).toFixed(1)}%)`
+    );
 
-  if (ratio < HIGHLIGHT_PERCENTAGE) return null;
+    if (ratio < HIGHLIGHT_PERCENTAGE) return null;
+  }
 
   try {
     const hlChannel = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
@@ -961,82 +958,6 @@ client.on(Events.MessageReactionRemoveAll, async (message) => {
     await syncAndPush(srcMsg);
   } catch (err) {
     console.warn(`⚠️  Could not sync reaction-clear for quoted message ${message.id}:`, err.message);
-  }
-});
-
-// ── Button interactions (emoji toggle) ───────────────────────────────────────
-//
-// When a user clicks an emoji button:
-//   1. Decode the emojiKey from customId.
-//   2. Look up the sourceId via mirrorToSource.
-//   3. Toggle the user in/out of reactionState[sourceId][emojiKey].
-//   4. Defer-update the interaction (no visible pop-up).
-//   5. Push updated buttons to all bot-sent copies:
-//      - For the clicked message, pass the viewer's userId so their Primary/
-//        Secondary toggle renders correctly.
-//      - All other copies get the neutral view (no viewer).
-//   6. Check if we've now crossed the highlight threshold.
-
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isButton()) return;
-
-  const emojiKey = decodeButtonId(interaction.customId);
-  if (emojiKey === null) return; // not one of our reaction buttons
-
-  const userId       = interaction.user.id;
-  const clickedMsgId = interaction.message.id;
-
-  // Find the source this button belongs to
-  const sourceId = mirrorToSource.get(clickedMsgId);
-  if (!sourceId) {
-    // Unknown button — just acknowledge silently
-    await interaction.deferUpdate().catch(() => {});
-    return;
-  }
-
-  // Toggle user in/out for this emoji
-  const state = getOrCreateState(sourceId);
-  if (!state.has(emojiKey)) state.set(emojiKey, new Set());
-  const userSet = state.get(emojiKey);
-
-  if (userSet.has(userId)) {
-    userSet.delete(userId);
-    console.log(`➖  ${userId} un-reacted ${emojiKey} on source ${sourceId}`);
-  } else {
-    userSet.add(userId);
-    console.log(`➕  ${userId} reacted ${emojiKey} on source ${sourceId}`);
-  }
-
-  // Acknowledge interaction immediately (required within 3 s, no visible reply)
-  await interaction.deferUpdate().catch(() => {});
-
-  // Build a viewerMap so the clicked message shows the correct Primary/Secondary state
-  const viewerMap = new Map([[clickedMsgId, userId]]);
-  await pushButtons(sourceId, viewerMap);
-
-  // Check highlight threshold if any mirror still lacks a highlight copy
-  const mirrors = mirroredMessages.get(sourceId) || [];
-  const hasMirrorWithoutHighlight = mirrors.some(e => !e.highlightId);
-
-  if (hasMirrorWithoutHighlight && HIGHLIGHT_CHANNEL_ID) {
-    const srcChannelId = sourceChannelMap.get(sourceId);
-    if (srcChannelId) {
-      try {
-        const srcChannel = await client.channels.fetch(srcChannelId);
-        const srcMsg     = await srcChannel.messages.fetch(sourceId);
-        const contentStr = await buildContent(srcMsg);
-        const mediaUrls  = extractMedia(srcMsg);
-        const attFiles   = await buildAttachments(mediaUrls);
-        const hlId = await maybeSendHighlight(srcMsg, contentStr, attFiles, state);
-        if (hlId) {
-          mirrorToSource.set(hlId, sourceId);
-          const entry = mirrors.find(e => !e.highlightId);
-          if (entry) entry.highlightId = hlId;
-        }
-      } catch (err) {
-        console.warn("⚠️  Highlight threshold check after button press failed:", err.message);
-      }
-    }
   }
 });
 
