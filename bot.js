@@ -3,6 +3,9 @@ const {
   GatewayIntentBits,
   Events,
   AttachmentBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require("discord.js");
 const https = require("https");
 const http  = require("http");
@@ -14,9 +17,9 @@ const TARGET_CHANNEL_IDS  = (process.env.TARGET_CHANNEL_ID  || "").split(",").ma
 const IGNORED_CHANNEL_IDS = (process.env.IGNORED_CHANNEL_ID || "").split(",").map(s => s.trim()).filter(Boolean);
 
 // Highlight / viral detection
-const HIGHLIGHT_CHANNEL_ID  = (process.env.HIGHLIGHT_ID         || "").trim();
-const HUMAN_ROLE_ID          = (process.env.HUMAN_ROLE_ID        || "").trim();
-const HIGHLIGHT_PERCENTAGE   = parseFloat(process.env.HIGHLIGHT_PERCENTAGE || "0") / 100; // stored as 0-1
+const HIGHLIGHT_CHANNEL_ID = (process.env.HIGHLIGHT_ID         || "").trim();
+const HUMAN_ROLE_ID        = (process.env.HUMAN_ROLE_ID        || "").trim();
+const HIGHLIGHT_PERCENTAGE = parseFloat(process.env.HIGHLIGHT_PERCENTAGE || "0") / 100; // stored as 0-1
 
 // Format: "USER_ID=Some message,USER_ID2=Another message"
 // Whenever a quote is authored by one of these users, the message is appended in italics.
@@ -64,16 +67,55 @@ const client = new Client({
   ],
 });
 
+// ── State maps ───────────────────────────────────────────────────────────────
+
 /**
  * mirroredMessages:  sourceMessageId → MirrorEntry[]
  *
  * MirrorEntry: {
- *   mirroredId      : string,
+ *   mirroredId      : string,          ← id of the bot-sent copy in the target channel
  *   targetChannelId : string,
  *   highlightId     : string | null,   ← id of the highlight-channel copy (if sent)
  * }
  */
 const mirroredMessages = new Map();
+
+/**
+ * sourceChannelMap:  sourceMessageId → sourceChannelId
+ *
+ * Stored at mirror time so that reaction events on the *original quoted* message
+ * can re-fetch the source-bot message without hunting through channel caches.
+ */
+const sourceChannelMap = new Map();
+
+/**
+ * reactionState:  sourceMessageId → Map< emojiKey, Set<userId> >
+ *
+ * Single source of truth for ALL emoji reactions across every copy of a mirrored
+ * message: the source-bot message, the original quoted message, the bot-sent
+ * mirrored message(s), and the highlight copy.
+ *
+ * emojiKey for unicode emoji : the character itself, e.g. "👍"
+ * emojiKey for custom emoji  : "<name>:<id>",          e.g. "pepehands:123456789"
+ *
+ * Populated from two sources:
+ *   • syncExternalReactions() — reads Discord reactions on the source-bot message
+ *     and the original quoted message and merges them (same user + same emoji
+ *     on both messages counts only once).
+ *   • InteractionCreate — toggles a user in/out when they click a button.
+ *
+ * Button-press entries survive re-syncs; syncExternalReactions only adds users,
+ * it does not remove users who pressed a button.
+ */
+const reactionState = new Map();
+
+/**
+ * mirrorToSource:  mirroredMsgId | highlightMsgId → sourceMessageId
+ *
+ * Reverse lookup used by the button-interaction handler to find which source
+ * message (and therefore which reactionState entry) owns a given button message.
+ */
+const mirrorToSource = new Map();
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -235,102 +277,210 @@ function getMirrors(sourceId) {
   return mirroredMessages.get(sourceId);
 }
 
-// ── Reaction helpers ─────────────────────────────────────────────────────────
+// ── Emoji key helpers ─────────────────────────────────────────────────────────
 
 /**
- * Merge reactions from two messages (the forwarded source and the original
- * quoted message it references), deduplicating users per emoji.
- *
- * Returns Map< emojiKey, Set<userId> >
- * where emojiKey is "<name>:<id>" for custom or just the unicode char for built-ins.
+ * Canonical string key for a Discord emoji:
+ *   custom  → "<name>:<id>"
+ *   unicode → the character itself
  */
-async function collectMergedReactions(sourceMessage) {
-  // Map: emojiKey → Set<userId>
-  const merged = new Map();
+function toEmojiKey(emoji) {
+  return emoji.id ? `${emoji.name}:${emoji.id}` : emoji.name;
+}
+
+/**
+ * Convert an emojiKey back to the argument Discord.js needs for ButtonBuilder.setEmoji().
+ *   unicode → the character string
+ *   custom  → { name, id } object
+ */
+function emojiArgFromKey(key) {
+  if (key.includes(":")) {
+    const colonIdx = key.indexOf(":");
+    return { name: key.slice(0, colonIdx), id: key.slice(colonIdx + 1) };
+  }
+  return key;
+}
+
+/**
+ * Button customId encoding.  Must stay under Discord's 100-char limit.
+ * Format: "rxn:<emojiKey>"
+ */
+function encodeButtonId(key) {
+  return `rxn:${key}`.slice(0, 100);
+}
+
+function decodeButtonId(customId) {
+  if (!customId.startsWith("rxn:")) return null;
+  return customId.slice(4);
+}
+
+// ── Button rendering ──────────────────────────────────────────────────────────
+
+/**
+ * Build ActionRow(s) of emoji buttons from a Map<emojiKey, Set<userId>>.
+ *
+ * Each button:
+ *   • Emoji label  — the actual emoji character / custom emoji
+ *   • Count label  — number of unique users in the set
+ *   • Style        — Primary (blurple) if viewerUserId is in the set (i.e. "you reacted"),
+ *                    Secondary (grey) otherwise — matching Discord's own toggle appearance.
+ *
+ * Discord buttons do NOT support hover tooltips (no title/description field on
+ * message components), so we cannot list reacted users on hover.
+ *
+ * Discord limits: 5 buttons per ActionRow, 5 rows per message (25 buttons max).
+ * Emojis with zero count are skipped.
+ */
+function buildButtonRows(mergedMap, viewerUserId = null) {
+  const buttons = [];
+
+  for (const [key, userSet] of mergedMap) {
+    const count = userSet.size;
+    if (count === 0) continue;
+
+    const isActive = viewerUserId !== null && userSet.has(viewerUserId);
+
+    const btn = new ButtonBuilder()
+      .setCustomId(encodeButtonId(key))
+      .setEmoji(emojiArgFromKey(key))
+      .setLabel(String(count))
+      .setStyle(isActive ? ButtonStyle.Primary : ButtonStyle.Secondary);
+
+    buttons.push(btn);
+    if (buttons.length >= 25) break; // hard Discord cap
+  }
+
+  if (buttons.length === 0) return [];
+
+  // Chunk into rows of 5
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
+  }
+  return rows;
+}
+
+// ── Reaction-state management ─────────────────────────────────────────────────
+
+/** Get or initialise the reactionState entry for a sourceId. */
+function getOrCreateState(sourceId) {
+  if (!reactionState.has(sourceId)) reactionState.set(sourceId, new Map());
+  return reactionState.get(sourceId);
+}
+
+/**
+ * Read actual Discord reactions from:
+ *   1. The source-bot message itself.
+ *   2. The original quoted message it references (if any).
+ *
+ * Merge them into reactionState[sourceId], deduplicating same user + same emoji
+ * across the two messages.  Button-press entries written by InteractionCreate
+ * are preserved — this function only adds, never removes.
+ *
+ * Returns the updated Map<emojiKey, Set<userId>>.
+ */
+async function syncExternalReactions(sourceMessage) {
+  const sourceId = sourceMessage.id;
+  const state    = getOrCreateState(sourceId);
 
   async function absorb(msg) {
-    // Ensure we have a full message object
     let fullMsg = msg;
     if (msg.partial) {
       try { fullMsg = await msg.fetch(); } catch { return; }
     }
     for (const [, reaction] of fullMsg.reactions.cache) {
-      const key = reaction.emoji.id
-        ? `${reaction.emoji.name}:${reaction.emoji.id}`
-        : reaction.emoji.name;
-      if (!merged.has(key)) merged.set(key, new Set());
-      const users = merged.get(key);
+      const key = toEmojiKey(reaction.emoji);
+      if (!state.has(key)) state.set(key, new Set());
+      const users = state.get(key);
       try {
-        // Fetch all users who reacted with this emoji
         const reactors = await reaction.users.fetch();
         for (const [userId] of reactors) {
           users.add(userId);
         }
       } catch (err) {
         console.warn(`⚠️  Could not fetch users for reaction ${key}:`, err.message);
-        // Fall back to just the count if we can't fetch users
+        // Sentinel so the emoji still appears as a button even without user ids
         users.add(`__count_${reaction.count}`);
       }
     }
   }
 
-  // 1. Absorb reactions from the forwarded (source) message
+  // 1. Reactions on the forwarded (source-bot) message itself
   await absorb(sourceMessage);
 
-  // 2. Absorb reactions from the original quoted message (if any)
+  // 2. Reactions on the original quoted message (if any)
   if (sourceMessage.reference?.messageId) {
     try {
       const refChannel = await client.channels.fetch(sourceMessage.reference.channelId);
       const refMessage = await refChannel.messages.fetch(sourceMessage.reference.messageId);
       await absorb(refMessage);
     } catch {
-      // Original may be deleted; ignore
+      // Original may be deleted — ignore
     }
   }
 
-  return merged;
+  return state;
 }
 
 /**
- * Apply merged reactions (from source + original quote) to a mirrored message.
- * Removes all existing reactions first, then adds one reaction per unique emoji.
- * Discord doesn't let bots set counts directly — we add the reaction once so it
- * shows as a reaction bubble, and the true merged count is displayed in the
- * message text footer (see buildReactionCountLine).
+ * Push the current merged state as button rows to every bot-sent copy that
+ * belongs to sourceId: the mirrored message(s) and the highlight copy (if any).
+ *
+ * viewerMap is an optional Map<msgId, userId> used to show the per-user toggle
+ * state (Primary) on a specific message for a specific viewer.
  */
-async function applyMergedReactions(sourceMessage, mirroredMsg) {
-  // Remove existing bot reactions
-  try { await mirroredMsg.reactions.removeAll(); } catch { /* may lack permission */ }
+async function pushButtons(sourceId, viewerMap = new Map()) {
+  const state   = reactionState.get(sourceId);
+  if (!state) return;
 
-  const merged = await collectMergedReactions(sourceMessage);
+  const mirrors = mirroredMessages.get(sourceId);
+  if (!mirrors || mirrors.length === 0) return;
 
-  for (const [emojiKey, userSet] of merged) {
-    if (userSet.size === 0) continue;
-    // Resolve emoji identifier back for react()
-    const emojiId = emojiKey.includes(":") ? emojiKey.split(":")[1] : emojiKey;
-    const emojiArg = emojiId || emojiKey;
+  for (const entry of mirrors) {
+    // Mirrored message
     try {
-      await mirroredMsg.react(emojiArg);
+      const viewer = viewerMap.get(entry.mirroredId) ?? null;
+      const rows   = buildButtonRows(state, viewer);
+      const ch     = await client.channels.fetch(entry.targetChannelId);
+      const msg    = await ch.messages.fetch(entry.mirroredId);
+      await msg.edit({ components: rows });
     } catch (err) {
-      console.warn(`⚠️  Could not react with ${emojiKey}:`, err.message);
+      console.warn(`⚠️  Could not push buttons to mirror ${entry.mirroredId}:`, err.message);
+    }
+
+    // Highlight copy
+    if (entry.highlightId) {
+      try {
+        const viewer = viewerMap.get(entry.highlightId) ?? null;
+        const rows   = buildButtonRows(state, viewer);
+        const hlCh   = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
+        const hlMsg  = await hlCh.messages.fetch(entry.highlightId);
+        await hlMsg.edit({ components: rows });
+      } catch (err) {
+        console.warn(`⚠️  Could not push buttons to highlight ${entry.highlightId}:`, err.message);
+      }
     }
   }
+}
 
-  return merged;
+/**
+ * Full sync pipeline (used by reaction-event handlers):
+ *   1. Pull external reactions (source + quoted original) into state.
+ *   2. Push updated buttons (neutral view) to all bot-sent copies.
+ * Returns the state map for further use (e.g. highlight threshold check).
+ */
+async function syncAndPush(sourceMessage) {
+  const state = await syncExternalReactions(sourceMessage);
+  await pushButtons(sourceMessage.id);
+  return state;
 }
 
 // ── Highlight helpers ─────────────────────────────────────────────────────────
 
-/**
- * Count members in the guild that have the HUMAN_ROLE_ID role.
- */
+/** Count members in the guild that have the HUMAN_ROLE_ID role. */
 async function countHumanMembers(guild) {
   if (!HUMAN_ROLE_ID) return 0;
   try {
-    // Fetch the role via REST — works without GuildMembers intent.
-    // If GuildMembers intent IS enabled, role.members.size is accurate.
-    // Without it the members cache is empty, so we fall back to a targeted
-    // REST search: fetch up to 1000 members at a time by role until exhausted.
     const role = await guild.roles.fetch(HUMAN_ROLE_ID);
     if (!role) return 0;
 
@@ -358,12 +508,12 @@ async function countHumanMembers(guild) {
 }
 
 /**
- * Return the total number of unique users who have reacted with any emoji,
- * from the merged reaction map.
+ * Return the total number of unique users who have reacted with any emoji.
+ * Sentinel "__count_N" entries are excluded from the unique-user tally.
  */
-function countUniqueReactors(merged) {
+function countUniqueReactors(state) {
   const all = new Set();
-  for (const userSet of merged.values()) {
+  for (const userSet of state.values()) {
     for (const uid of userSet) {
       if (!uid.startsWith("__count_")) all.add(uid);
     }
@@ -372,19 +522,17 @@ function countUniqueReactors(merged) {
 }
 
 /**
- * Send (or skip) a highlight copy if the reaction threshold is met.
+ * Send a highlight copy if the reaction threshold is now met.
  * Returns the highlight message id if sent, null otherwise.
- *
- * entry.highlightId is set so we can delete it later if needed.
  */
-async function maybeSendHighlight(sourceMessage, content, attachments, merged) {
+async function maybeSendHighlight(sourceMessage, content, attachments, state) {
   if (!HIGHLIGHT_CHANNEL_ID || !HUMAN_ROLE_ID || HIGHLIGHT_PERCENTAGE <= 0) return null;
 
   const guild = sourceMessage.guild;
   if (!guild) return null;
 
   const humanCount   = await countHumanMembers(guild);
-  const reactorCount = countUniqueReactors(merged);
+  const reactorCount = countUniqueReactors(state);
 
   if (humanCount === 0) return null;
 
@@ -399,10 +547,10 @@ async function maybeSendHighlight(sourceMessage, content, attachments, merged) {
   try {
     const hlChannel = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
     if (!hlChannel?.isTextBased()) return null;
-    const hlMsg = await hlChannel.send({ content, files: attachments });
+
+    const rows  = buildButtonRows(state); // neutral view
+    const hlMsg = await hlChannel.send({ content, files: attachments, components: rows });
     console.log(`⭐  Sent highlight copy → ${hlMsg.id} in #${HIGHLIGHT_CHANNEL_ID}`);
-    // Mirror reactions onto the highlight copy too
-    await applyMergedReactions(sourceMessage, hlMsg);
     return hlMsg.id;
   } catch (err) {
     console.error("❌  Failed to send highlight message:", err);
@@ -413,13 +561,18 @@ async function maybeSendHighlight(sourceMessage, content, attachments, merged) {
 // ── Core mirroring ────────────────────────────────────────────────────────────
 
 /**
- * Mirror a message to all target channels.
+ * Mirror a message to all target channels, attaching emoji buttons.
  * Returns an array of MirrorEntry objects for bookkeeping.
  */
 async function mirrorToAllTargets(sourceMessage, mediaUrls) {
   const content     = await buildContent(sourceMessage);
   const attachments = await buildAttachments(mediaUrls);
-  const results     = [];
+
+  // Seed reaction state from external reactions before the first send
+  const state = await syncExternalReactions(sourceMessage);
+  const rows  = buildButtonRows(state); // neutral view on first render
+
+  const results = [];
 
   for (const channelId of TARGET_CHANNEL_IDS) {
     try {
@@ -428,24 +581,29 @@ async function mirrorToAllTargets(sourceMessage, mediaUrls) {
         console.warn(`⚠️  Target channel ${channelId} is not a text channel.`);
         continue;
       }
-      const mirrored = await targetChannel.send({ content, files: attachments });
+
+      const mirrored = await targetChannel.send({ content, files: attachments, components: rows });
       console.log(`📤  Mirrored ${sourceMessage.id} → ${mirrored.id} in #${channelId}`);
 
-      // Apply merged reactions (source + original quoted message)
-      const merged = await applyMergedReactions(sourceMessage, mirrored);
+      // Register reverse lookup
+      mirrorToSource.set(mirrored.id, sourceMessage.id);
 
       // Check highlight threshold
-      const highlightId = await maybeSendHighlight(sourceMessage, content, attachments, merged);
+      const highlightId = await maybeSendHighlight(sourceMessage, content, attachments, state);
+      if (highlightId) mirrorToSource.set(highlightId, sourceMessage.id);
 
       results.push({
         mirroredId:      mirrored.id,
         targetChannelId: channelId,
-        highlightId,
+        highlightId:     highlightId ?? null,
       });
     } catch (err) {
       console.error(`❌  Failed to mirror to channel ${channelId}:`, err);
     }
   }
+
+  // Store the source channel so reaction events on the quoted message can re-fetch
+  sourceChannelMap.set(sourceMessage.id, sourceMessage.channelId);
 
   return results;
 }
@@ -523,8 +681,8 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
   }
 
   // Case 2: already mirrored — update or delete each mirror
-  const content     = mediaUrls.length > 0 ? await buildContent(newMessage)         : null;
-  const attachments = mediaUrls.length > 0 ? await buildAttachments(mediaUrls)      : null;
+  const content     = mediaUrls.length > 0 ? await buildContent(newMessage)    : null;
+  const attachments = mediaUrls.length > 0 ? await buildAttachments(mediaUrls) : null;
 
   for (const entry of [...mirrors]) {
     try {
@@ -532,8 +690,9 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
       const mirroredMsg   = await targetChannel.messages.fetch(entry.mirroredId);
 
       if (!content) {
-        // Delete the mirror and any associated highlight copy
+        // ── No more media: delete mirrored copy, highlight copy, and the source message ──
         await mirroredMsg.delete();
+        mirrorToSource.delete(entry.mirroredId);
         mirrors.splice(mirrors.indexOf(entry), 1);
         console.log(`🗑️   Deleted mirror ${entry.mirroredId} (media removed)`);
 
@@ -542,6 +701,7 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
             const hlChannel = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
             const hlMsg     = await hlChannel.messages.fetch(entry.highlightId);
             await hlMsg.delete();
+            mirrorToSource.delete(entry.highlightId);
             console.log(`🗑️   Deleted highlight copy ${entry.highlightId}`);
           } catch (hlErr) {
             console.warn(`⚠️  Could not delete highlight copy ${entry.highlightId}:`, hlErr.message);
@@ -549,39 +709,47 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
           entry.highlightId = null;
         }
 
-        // Also delete the source bot message
+        // Also delete the source bot message (the "forwarded" message from the other bot)
         try {
           await newMessage.delete();
           console.log(`🗑️   Deleted source message ${newMessage.id} (quote removed)`);
         } catch (srcErr) {
           console.warn(`⚠️  Could not delete source message ${newMessage.id}:`, srcErr.message);
         }
-      } else {
-        // Edit is tricky with attachments — we must delete and resend to swap files
-        // (Discord.js doesn't support replacing attachments on existing messages cleanly)
-        const newMirrored = await targetChannel.send({ content, files: attachments });
-        await mirroredMsg.delete().catch(() => {});
-        entry.mirroredId = newMirrored.id;
 
-        // Re-apply merged reactions
-        const merged = await applyMergedReactions(newMessage, newMirrored);
+      } else {
+        // ── Re-send mirror with fresh attachments + updated buttons ──
+        // (Discord.js doesn't support replacing attachments on an existing message cleanly)
+        const state = await syncExternalReactions(newMessage);
+        const rows  = buildButtonRows(state);
+
+        const newMirrored = await targetChannel.send({ content, files: attachments, components: rows });
+        await mirroredMsg.delete().catch(() => {});
+
+        mirrorToSource.delete(entry.mirroredId);
+        mirrorToSource.set(newMirrored.id, newMessage.id);
+        entry.mirroredId = newMirrored.id;
 
         // Update highlight copy if it exists
         if (entry.highlightId) {
           try {
             const hlChannel = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
             const hlMsg     = await hlChannel.messages.fetch(entry.highlightId);
-            const newHl     = await hlChannel.send({ content, files: attachments });
+            const newHl     = await hlChannel.send({ content, files: attachments, components: rows });
             await hlMsg.delete().catch(() => {});
+            mirrorToSource.delete(entry.highlightId);
+            mirrorToSource.set(newHl.id, newMessage.id);
             entry.highlightId = newHl.id;
-            await applyMergedReactions(newMessage, newHl);
           } catch (hlErr) {
             console.warn(`⚠️  Could not update highlight copy:`, hlErr.message);
           }
         } else {
-          // Check if the updated reactions now clear the highlight bar
-          const newHighlightId = await maybeSendHighlight(newMessage, content, attachments, merged);
-          entry.highlightId = newHighlightId;
+          // Check if the updated reactions now cross the highlight threshold
+          const newHighlightId = await maybeSendHighlight(newMessage, content, attachments, state);
+          if (newHighlightId) {
+            mirrorToSource.set(newHighlightId, newMessage.id);
+            entry.highlightId = newHighlightId;
+          }
         }
 
         console.log(`✏️   Re-sent mirror as ${newMirrored.id} (edit with new attachments)`);
@@ -591,7 +759,11 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
     }
   }
 
-  if (mirrors.length === 0) mirroredMessages.delete(newMessage.id);
+  if (mirrors.length === 0) {
+    mirroredMessages.delete(newMessage.id);
+    reactionState.delete(newMessage.id);
+    sourceChannelMap.delete(newMessage.id);
+  }
 });
 
 // Deleted message ─────────────────────────────────────────────────────────────
@@ -604,6 +776,7 @@ client.on(Events.MessageDelete, async (message) => {
       const targetChannel = await client.channels.fetch(entry.targetChannelId);
       const mirroredMsg   = await targetChannel.messages.fetch(entry.mirroredId);
       await mirroredMsg.delete();
+      mirrorToSource.delete(entry.mirroredId);
       console.log(`🗑️   Deleted mirror ${entry.mirroredId} for deleted source ${message.id}`);
     } catch (err) {
       console.warn(`⚠️  Could not delete mirror ${entry.mirroredId}:`, err.message);
@@ -615,6 +788,7 @@ client.on(Events.MessageDelete, async (message) => {
         const hlChannel = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
         const hlMsg     = await hlChannel.messages.fetch(entry.highlightId);
         await hlMsg.delete();
+        mirrorToSource.delete(entry.highlightId);
         console.log(`🗑️   Deleted highlight copy ${entry.highlightId} for deleted source ${message.id}`);
       } catch (hlErr) {
         console.warn(`⚠️  Could not delete highlight copy ${entry.highlightId}:`, hlErr.message);
@@ -623,54 +797,106 @@ client.on(Events.MessageDelete, async (message) => {
   }
 
   mirroredMessages.delete(message.id);
+  reactionState.delete(message.id);
+  sourceChannelMap.delete(message.id);
 });
+
+// ── Reaction events ───────────────────────────────────────────────────────────
+//
+// We watch for reactions on two kinds of messages:
+//
+//   (A) The source-bot message itself — identified by its author being in SOURCE_BOT_IDS
+//       and its id being in mirroredMessages.
+//
+//   (B) The original quoted message that the source-bot message references — this
+//       message is authored by someone else and doesn't appear in mirroredMessages.
+//       We identify it by scanning sourceChannelMap: for every tracked source, we
+//       re-fetch the source-bot message and check if its reference.messageId matches
+//       the message that just got a reaction.
+//
+// findSourceIdForQuotedMessage() handles path (B).
+
+/**
+ * Given a message id that just received a reaction, scan all tracked sources
+ * to find one whose source-bot message references this id.
+ * Returns the sourceMessageId, or null if no match.
+ */
+async function findSourceIdForQuotedMessage(quotedMessageId) {
+  for (const [srcId, srcChannelId] of sourceChannelMap) {
+    try {
+      const srcChannel = await client.channels.fetch(srcChannelId);
+      const srcMsg     = await srcChannel.messages.fetch(srcId);
+      if (srcMsg.reference?.messageId === quotedMessageId) return srcId;
+    } catch {
+      // Source may be deleted or unavailable — skip
+    }
+  }
+  return null;
+}
 
 // Reaction added ──────────────────────────────────────────────────────────────
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
-  // Ignore reactions from our own bot (prevents loops)
+  // Ignore our own bot — shouldn't happen with button-only flow, but be safe
   if (user.id === client.user.id) return;
 
-  // Resolve partial reaction
   if (reaction.partial) {
     try { reaction = await reaction.fetch(); }
     catch (err) { console.error("❌  Could not fetch reaction:", err); return; }
   }
 
-  const sourceMessage = reaction.message;
-  if (!SOURCE_BOT_IDS.includes(sourceMessage.author?.id)) return;
+  const reactedMsg = reaction.message;
 
-  const mirrors = mirroredMessages.get(sourceMessage.id);
-  if (!mirrors || mirrors.length === 0) return;
+  // ── Path A: reaction on the source-bot message ──
+  if (SOURCE_BOT_IDS.includes(reactedMsg.author?.id) && mirroredMessages.has(reactedMsg.id)) {
+    let fullSource;
+    try { fullSource = await reactedMsg.fetch(); } catch { return; }
 
-  // Fetch full source message to get accurate merged reactions
-  let fullSource;
-  try { fullSource = await sourceMessage.fetch(); }
-  catch { return; }
+    const state   = await syncAndPush(fullSource);
+    const mirrors = mirroredMessages.get(fullSource.id) || [];
 
-  for (const entry of mirrors) {
-    try {
-      const targetChannel = await client.channels.fetch(entry.targetChannelId);
-      const mirroredMsg   = await targetChannel.messages.fetch(entry.mirroredId);
-      const merged        = await applyMergedReactions(fullSource, mirroredMsg);
-
-      // Check whether we've now crossed the highlight threshold
+    // Check highlight threshold for mirrors that don't yet have a highlight copy
+    for (const entry of mirrors) {
       if (!entry.highlightId && HIGHLIGHT_CHANNEL_ID) {
-        const content     = await buildContent(fullSource);
-        const mediaUrls   = extractMedia(fullSource);
-        const attachments = await buildAttachments(mediaUrls);
-        const hlId = await maybeSendHighlight(fullSource, content, attachments, merged);
-        if (hlId) entry.highlightId = hlId;
-      } else if (entry.highlightId) {
-        // Keep highlight copy's reactions in sync too
-        try {
-          const hlChannel = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
-          const hlMsg     = await hlChannel.messages.fetch(entry.highlightId);
-          await applyMergedReactions(fullSource, hlMsg);
-        } catch { /* ignore */ }
+        const contentStr = await buildContent(fullSource);
+        const mediaUrls  = extractMedia(fullSource);
+        const attFiles   = await buildAttachments(mediaUrls);
+        const hlId = await maybeSendHighlight(fullSource, contentStr, attFiles, state);
+        if (hlId) {
+          mirrorToSource.set(hlId, fullSource.id);
+          entry.highlightId = hlId;
+        }
       }
-    } catch (err) {
-      console.warn(`⚠️  Could not sync reaction add to mirror ${entry.mirroredId}:`, err.message);
     }
+    return;
+  }
+
+  // ── Path B: reaction on the original quoted message ──
+  const sourceId = await findSourceIdForQuotedMessage(reactedMsg.id);
+  if (!sourceId) return;
+
+  const srcChannelId = sourceChannelMap.get(sourceId);
+  if (!srcChannelId) return;
+
+  try {
+    const srcChannel = await client.channels.fetch(srcChannelId);
+    const srcMsg     = await srcChannel.messages.fetch(sourceId);
+    const state      = await syncAndPush(srcMsg);
+    const mirrors    = mirroredMessages.get(sourceId) || [];
+
+    for (const entry of mirrors) {
+      if (!entry.highlightId && HIGHLIGHT_CHANNEL_ID) {
+        const contentStr = await buildContent(srcMsg);
+        const mediaUrls  = extractMedia(srcMsg);
+        const attFiles   = await buildAttachments(mediaUrls);
+        const hlId = await maybeSendHighlight(srcMsg, contentStr, attFiles, state);
+        if (hlId) {
+          mirrorToSource.set(hlId, sourceId);
+          entry.highlightId = hlId;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`⚠️  Could not sync reaction add for quoted message ${reactedMsg.id}:`, err.message);
   }
 });
 
@@ -683,57 +909,133 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
     catch (err) { console.error("❌  Could not fetch reaction:", err); return; }
   }
 
-  const sourceMessage = reaction.message;
-  if (!SOURCE_BOT_IDS.includes(sourceMessage.author?.id)) return;
+  const reactedMsg = reaction.message;
 
-  const mirrors = mirroredMessages.get(sourceMessage.id);
-  if (!mirrors || mirrors.length === 0) return;
+  // ── Path A: reaction removed from the source-bot message ──
+  if (SOURCE_BOT_IDS.includes(reactedMsg.author?.id) && mirroredMessages.has(reactedMsg.id)) {
+    let fullSource;
+    try { fullSource = await reactedMsg.fetch(); } catch { return; }
+    // Re-syncing will call reaction.users.fetch() which now excludes the removed user
+    await syncAndPush(fullSource);
+    return;
+  }
 
-  let fullSource;
-  try { fullSource = await sourceMessage.fetch(); }
-  catch { return; }
+  // ── Path B: reaction removed from the original quoted message ──
+  const sourceId = await findSourceIdForQuotedMessage(reactedMsg.id);
+  if (!sourceId) return;
 
-  for (const entry of mirrors) {
-    try {
-      const targetChannel = await client.channels.fetch(entry.targetChannelId);
-      const mirroredMsg   = await targetChannel.messages.fetch(entry.mirroredId);
-      await applyMergedReactions(fullSource, mirroredMsg);
+  const srcChannelId = sourceChannelMap.get(sourceId);
+  if (!srcChannelId) return;
 
-      // Sync highlight copy if present
-      if (entry.highlightId) {
-        try {
-          const hlChannel = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
-          const hlMsg     = await hlChannel.messages.fetch(entry.highlightId);
-          await applyMergedReactions(fullSource, hlMsg);
-        } catch { /* ignore */ }
-      }
-    } catch (err) {
-      console.warn(`⚠️  Could not sync reaction remove to mirror ${entry.mirroredId}:`, err.message);
-    }
+  try {
+    const srcChannel = await client.channels.fetch(srcChannelId);
+    const srcMsg     = await srcChannel.messages.fetch(sourceId);
+    await syncAndPush(srcMsg);
+  } catch (err) {
+    console.warn(`⚠️  Could not sync reaction remove for quoted message ${reactedMsg.id}:`, err.message);
   }
 });
 
 // All reactions cleared ───────────────────────────────────────────────────────
 client.on(Events.MessageReactionRemoveAll, async (message) => {
-  const mirrors = mirroredMessages.get(message.id);
-  if (!mirrors || mirrors.length === 0) return;
+  // ── Path A: cleared on the source-bot message ──
+  if (mirroredMessages.has(message.id)) {
+    // Re-syncing will find zero reactions and update buttons accordingly.
+    // Button-press entries in reactionState are intentionally preserved.
+    let fullSource;
+    try { fullSource = await message.fetch(); } catch { return; }
+    await syncAndPush(fullSource);
+    return;
+  }
 
-  for (const entry of mirrors) {
-    try {
-      const targetChannel = await client.channels.fetch(entry.targetChannelId);
-      const mirroredMsg   = await targetChannel.messages.fetch(entry.mirroredId);
-      await mirroredMsg.reactions.removeAll();
-    } catch (err) {
-      console.warn(`⚠️  Could not clear reactions on mirror ${entry.mirroredId}:`, err.message);
-    }
+  // ── Path B: cleared on the original quoted message ──
+  const sourceId = await findSourceIdForQuotedMessage(message.id);
+  if (!sourceId) return;
 
-    // Clear highlight copy reactions too
-    if (entry.highlightId) {
+  const srcChannelId = sourceChannelMap.get(sourceId);
+  if (!srcChannelId) return;
+
+  try {
+    const srcChannel = await client.channels.fetch(srcChannelId);
+    const srcMsg     = await srcChannel.messages.fetch(sourceId);
+    await syncAndPush(srcMsg);
+  } catch (err) {
+    console.warn(`⚠️  Could not sync reaction-clear for quoted message ${message.id}:`, err.message);
+  }
+});
+
+// ── Button interactions (emoji toggle) ───────────────────────────────────────
+//
+// When a user clicks an emoji button:
+//   1. Decode the emojiKey from customId.
+//   2. Look up the sourceId via mirrorToSource.
+//   3. Toggle the user in/out of reactionState[sourceId][emojiKey].
+//   4. Defer-update the interaction (no visible pop-up).
+//   5. Push updated buttons to all bot-sent copies:
+//      - For the clicked message, pass the viewer's userId so their Primary/
+//        Secondary toggle renders correctly.
+//      - All other copies get the neutral view (no viewer).
+//   6. Check if we've now crossed the highlight threshold.
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton()) return;
+
+  const emojiKey = decodeButtonId(interaction.customId);
+  if (emojiKey === null) return; // not one of our reaction buttons
+
+  const userId       = interaction.user.id;
+  const clickedMsgId = interaction.message.id;
+
+  // Find the source this button belongs to
+  const sourceId = mirrorToSource.get(clickedMsgId);
+  if (!sourceId) {
+    // Unknown button — just acknowledge silently
+    await interaction.deferUpdate().catch(() => {});
+    return;
+  }
+
+  // Toggle user in/out for this emoji
+  const state = getOrCreateState(sourceId);
+  if (!state.has(emojiKey)) state.set(emojiKey, new Set());
+  const userSet = state.get(emojiKey);
+
+  if (userSet.has(userId)) {
+    userSet.delete(userId);
+    console.log(`➖  ${userId} un-reacted ${emojiKey} on source ${sourceId}`);
+  } else {
+    userSet.add(userId);
+    console.log(`➕  ${userId} reacted ${emojiKey} on source ${sourceId}`);
+  }
+
+  // Acknowledge interaction immediately (required within 3 s, no visible reply)
+  await interaction.deferUpdate().catch(() => {});
+
+  // Build a viewerMap so the clicked message shows the correct Primary/Secondary state
+  const viewerMap = new Map([[clickedMsgId, userId]]);
+  await pushButtons(sourceId, viewerMap);
+
+  // Check highlight threshold if any mirror still lacks a highlight copy
+  const mirrors = mirroredMessages.get(sourceId) || [];
+  const hasMirrorWithoutHighlight = mirrors.some(e => !e.highlightId);
+
+  if (hasMirrorWithoutHighlight && HIGHLIGHT_CHANNEL_ID) {
+    const srcChannelId = sourceChannelMap.get(sourceId);
+    if (srcChannelId) {
       try {
-        const hlChannel = await client.channels.fetch(HIGHLIGHT_CHANNEL_ID);
-        const hlMsg     = await hlChannel.messages.fetch(entry.highlightId);
-        await hlMsg.reactions.removeAll();
-      } catch { /* ignore */ }
+        const srcChannel = await client.channels.fetch(srcChannelId);
+        const srcMsg     = await srcChannel.messages.fetch(sourceId);
+        const contentStr = await buildContent(srcMsg);
+        const mediaUrls  = extractMedia(srcMsg);
+        const attFiles   = await buildAttachments(mediaUrls);
+        const hlId = await maybeSendHighlight(srcMsg, contentStr, attFiles, state);
+        if (hlId) {
+          mirrorToSource.set(hlId, sourceId);
+          const entry = mirrors.find(e => !e.highlightId);
+          if (entry) entry.highlightId = hlId;
+        }
+      } catch (err) {
+        console.warn("⚠️  Highlight threshold check after button press failed:", err.message);
+      }
     }
   }
 });
