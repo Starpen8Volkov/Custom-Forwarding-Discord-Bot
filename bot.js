@@ -6,6 +6,8 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  REST,
+  Routes,
 } = require("discord.js");
 const https = require("https");
 const http  = require("http");
@@ -17,6 +19,9 @@ const path  = require("path");
 const SOURCE_BOT_IDS      = (process.env.SOURCE_BOT_ID      || "").split(",").map(s => s.trim()).filter(Boolean);
 const TARGET_CHANNEL_IDS  = (process.env.TARGET_CHANNEL_ID  || "").split(",").map(s => s.trim()).filter(Boolean);
 const IGNORED_CHANNEL_IDS = (process.env.IGNORED_CHANNEL_ID || "").split(",").map(s => s.trim()).filter(Boolean);
+
+// Moderator role — only members of this role may use /reload
+const MOD_ROLE_ID = (process.env.MOD_ID || "").trim();
 
 // Highlight / viral detection
 const HIGHLIGHT_CHANNEL_ID = (process.env.HIGHLIGHT_ID         || "").trim();
@@ -780,6 +785,9 @@ client.once(Events.ClientReady, () => {
   // initial load (e.g. entries added just under the cutoff on load, now expired).
   pruneOldEntries();
 
+  // Register slash commands now that we have client.user.id
+  registerSlashCommands();
+
   // 12-hourly prune schedule
   setInterval(pruneOldEntries, 12 * 60 * 60 * 1000);
 });
@@ -1213,8 +1221,222 @@ client.on(Events.MessageReactionRemoveAll, async (message) => {
   }
 });
 
+// ── /reload command registration ──────────────────────────────────────────────
+
+/**
+ * Register the /reload slash command with Discord.
+ * Called once after the bot is ready so we have the application ID.
+ */
+async function registerSlashCommands() {
+  const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
+  const commands = [
+    {
+      name: "reload",
+      description: "Re-sync all state-file entries: forward missing mirrors, fix emoji counts, and check highlights.",
+    },
+  ];
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log("✅  Registered /reload slash command.");
+  } catch (err) {
+    console.error("❌  Failed to register slash commands:", err.message);
+  }
+}
+
+// ── /reload implementation ────────────────────────────────────────────────────
+
+/**
+ * Pass 1 — ensure every state-file entry has been forwarded to every target channel.
+ * If a mirror entry is missing for a target channel, re-sends it.
+ * Returns a summary of how many were forwarded.
+ */
+async function reloadPass1ForwardMissing() {
+  let forwarded = 0;
+  let skipped   = 0;
+
+  for (const [srcId, mirrors] of mirroredMessages) {
+    const srcChannelId = sourceChannelMap.get(srcId);
+    if (!srcChannelId) { skipped++; continue; }
+
+    let srcMsg;
+    try {
+      const srcChannel = await client.channels.fetch(srcChannelId);
+      srcMsg = await srcChannel.messages.fetch(srcId);
+    } catch {
+      skipped++;
+      continue; // source deleted or inaccessible
+    }
+
+    const mediaUrls = extractMedia(srcMsg);
+    if (mediaUrls.length === 0) { skipped++; continue; }
+
+    for (const channelId of TARGET_CHANNEL_IDS) {
+      const alreadyMirrored = mirrors.some(e => e.targetChannelId === channelId);
+      if (alreadyMirrored) continue;
+
+      try {
+        const content     = await buildContent(srcMsg);
+        const attachments = await buildAttachments(mediaUrls);
+        const state       = await syncExternalReactions(srcMsg);
+        const rows        = buildButtonRows(state);
+
+        const targetChannel = await client.channels.fetch(channelId);
+        if (!targetChannel?.isTextBased()) continue;
+
+        const mirrored = await targetChannel.send({ content, files: attachments, components: rows });
+        mirrorToSource.set(mirrored.id, srcId);
+
+        mirrors.push({
+          mirroredId:      mirrored.id,
+          targetChannelId: channelId,
+          highlightId:     null,
+          mirroredAt:      Date.now(),
+        });
+        forwarded++;
+        console.log(`🔄  /reload pass 1: forwarded ${srcId} → ${mirrored.id} in #${channelId}`);
+      } catch (err) {
+        console.warn(`⚠️  /reload pass 1: failed to forward ${srcId} to ${channelId}:`, err.message);
+      }
+    }
+  }
+
+  if (forwarded > 0) saveState();
+  return { forwarded, skipped };
+}
+
+/**
+ * Pass 2 — re-sync emoji button counts on every mirrored message.
+ * Calls syncAndPush for every tracked source message.
+ * Returns the number of messages updated.
+ */
+async function reloadPass2SyncEmojis() {
+  let updated = 0;
+  let skipped  = 0;
+
+  for (const [srcId, mirrors] of mirroredMessages) {
+    if (!mirrors || mirrors.length === 0) continue;
+    const srcChannelId = sourceChannelMap.get(srcId);
+    if (!srcChannelId) { skipped++; continue; }
+
+    try {
+      const srcChannel = await client.channels.fetch(srcChannelId);
+      const srcMsg     = await srcChannel.messages.fetch(srcId);
+      await syncAndPush(srcMsg);
+      updated++;
+    } catch {
+      skipped++;
+    }
+  }
+
+  return { updated, skipped };
+}
+
+/**
+ * Pass 3 — check every mirrored entry that does not yet have a highlight copy.
+ * If the current reaction state meets the highlight threshold, sends the highlight.
+ * Returns the number of new highlight messages sent.
+ */
+async function reloadPass3CheckHighlights() {
+  let sent    = 0;
+  let skipped = 0;
+
+  if (!HIGHLIGHT_CHANNEL_ID || !HUMAN_ROLE_ID) return { sent, skipped };
+
+  for (const [srcId, mirrors] of mirroredMessages) {
+    if (!mirrors || mirrors.length === 0) continue;
+    const srcChannelId = sourceChannelMap.get(srcId);
+    if (!srcChannelId) { skipped++; continue; }
+
+    // Skip if all entries already have a highlight copy
+    const needsHighlight = mirrors.some(e => !e.highlightId);
+    if (!needsHighlight) continue;
+
+    try {
+      const srcChannel = await client.channels.fetch(srcChannelId);
+      const srcMsg     = await srcChannel.messages.fetch(srcId);
+      const state      = reactionState.get(srcId) || await syncExternalReactions(srcMsg);
+      const content    = await buildContent(srcMsg);
+      const mediaUrls  = extractMedia(srcMsg);
+      const attFiles   = await buildAttachments(mediaUrls);
+      const hlId       = await maybeSendHighlight(srcMsg, content, attFiles, state);
+
+      if (hlId) {
+        mirrorToSource.set(hlId, srcId);
+        // Assign highlight id to all entries that are still missing one
+        for (const entry of mirrors) {
+          if (!entry.highlightId) entry.highlightId = hlId;
+        }
+        sent++;
+        saveState();
+      }
+    } catch (err) {
+      console.warn(`⚠️  /reload pass 3: could not check highlights for ${srcId}:`, err.message);
+      skipped++;
+    }
+  }
+
+  return { sent, skipped };
+}
+
+// ── Interaction handler ───────────────────────────────────────────────────────
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== "reload") return;
+
+  // Role guard — check MOD_ROLE_ID
+  if (!MOD_ROLE_ID) {
+    await interaction.reply({ content: "❌ MOD_ID is not configured. Command unavailable.", ephemeral: true });
+    return;
+  }
+
+  const member = interaction.member;
+  const hasRole = member?.roles?.cache?.has(MOD_ROLE_ID) ?? false;
+  if (!hasRole) {
+    await interaction.reply({ content: "❌ You don't have permission to use this command.", ephemeral: true });
+    return;
+  }
+
+  // Defer ephemerally — the three passes can take a while
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    const totalEntries = mirroredMessages.size;
+
+    // Pass 1: forward missing mirrors
+    const p1 = await reloadPass1ForwardMissing();
+
+    // Pass 2: sync emoji counts
+    const p2 = await reloadPass2SyncEmojis();
+
+    // Pass 3: check highlight eligibility
+    const p3 = await reloadPass3CheckHighlights();
+
+    const lines = [
+      `🔄 **Reload complete** — ${totalEntries} state entries processed.`,
+      ``,
+      `**Pass 1 — Forward missing mirrors**`,
+      `  • Forwarded: ${p1.forwarded}  |  Skipped: ${p1.skipped}`,
+      ``,
+      `**Pass 2 — Sync emoji counts**`,
+      `  • Updated: ${p2.updated}  |  Skipped: ${p2.skipped}`,
+      ``,
+      `**Pass 3 — Check highlights**`,
+      `  • New highlights sent: ${p3.sent}  |  Skipped: ${p3.skipped}`,
+    ];
+
+    await interaction.editReply({ content: lines.join("\n") });
+  } catch (err) {
+    console.error("❌  /reload failed:", err);
+    await interaction.editReply({ content: `❌ Reload failed: ${err.message}` });
+  }
+});
+
 // ── Boot sequence ─────────────────────────────────────────────────────────────
 // Load persisted state before connecting so the maps are populated
 // before any Discord events can fire.
 loadState();
 client.login(BOT_TOKEN);
+reloadPass1ForwardMissing();
+reloadPass2SyncEmojis();
+reloadPass3CheckHighlights();
